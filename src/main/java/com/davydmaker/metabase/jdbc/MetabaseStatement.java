@@ -69,6 +69,14 @@ public class MetabaseStatement implements Statement {
     public ResultSet executeQuery(String sql) throws SQLException {
         closeCurrentResultSet();
         
+        if (isSessionCommand(sql)) {
+            handleSessionCommand(sql);
+            currentResultSet = new MetabaseResultSet(this,
+                new MetabaseQueryResult(new ArrayList<>(), new ArrayList<>()));
+            updateCount = -1;
+            return currentResultSet;
+        }
+        
         try {
             MetabaseQueryResult result = apiClient.executeQuery(sql, databaseName);
             
@@ -85,6 +93,12 @@ public class MetabaseStatement implements Statement {
     @Override
     public int executeUpdate(String sql) throws SQLException {
         closeCurrentResultSet();
+        
+        if (isSessionCommand(sql)) {
+            handleSessionCommand(sql);
+            updateCount = 0;
+            return 0;
+        }
         
         throw new SQLFeatureNotSupportedException("Metabase is read-only. Updates are not supported.");
     }
@@ -158,6 +172,12 @@ public class MetabaseStatement implements Statement {
             currentResultSet = executeCustomCommand(sql);
             updateCount = -1;
             return true;
+        }
+        
+        if (isSessionCommand(sql)) {
+            handleSessionCommand(sql);
+            updateCount = 0;
+            return false;
         }
         
         try {
@@ -381,6 +401,77 @@ public class MetabaseStatement implements Statement {
         
         String cleanSql = sql.trim().toLowerCase();
         return cleanSql.startsWith("metabase ");
+    }
+    
+    private static final java.util.regex.Pattern SESSION_COMMAND_PATTERN = java.util.regex.Pattern.compile(
+        "^(set|reset|use|discard)(\\s.*|;)?$",
+        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+    
+    private static final java.util.regex.Pattern SEARCH_PATH_PATTERN = java.util.regex.Pattern.compile(
+        "^set\\s+(?:(?:session|local)\\s+)?(?:search_path\\s*(?:=|\\s+to\\s+)|schema\\s+)(.+?)\\s*;?$",
+        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+    
+    /**
+     * Strips leading whitespace and SQL comments from a statement.
+     */
+    static String stripLeadingComments(String sql) {
+        String s = sql.trim();
+        while (true) {
+            if (s.startsWith("--")) {
+                int nl = s.indexOf('\n');
+                s = nl < 0 ? "" : s.substring(nl + 1).trim();
+            } else if (s.startsWith("/*")) {
+                int end = s.indexOf("*/");
+                s = end < 0 ? "" : s.substring(end + 2).trim();
+            } else {
+                return s;
+            }
+        }
+    }
+    
+    /**
+     * Checks if SQL is a session-level statement (SET, RESET, USE, DISCARD).
+     * Metabase only runs queries that return a result set and uses pooled
+     * connections, so session state cannot be applied remotely. Clients such as
+     * IntelliJ/DataGrip issue these statements (e.g. {@code set search_path = "x"})
+     * when a schema is selected in the console, so they are handled locally.
+     */
+    static boolean isSessionCommand(String sql) {
+        if (sql == null) {
+            return false;
+        }
+        return SESSION_COMMAND_PATTERN.matcher(stripLeadingComments(sql)).matches();
+    }
+    
+    /**
+     * Extracts the first schema from a {@code SET search_path} / {@code SET SCHEMA} statement.
+     *
+     * @return schema name, or null if the statement does not set a schema
+     */
+    static String extractSchemaFromSessionCommand(String sql) {
+        if (sql == null) {
+            return null;
+        }
+        java.util.regex.Matcher m = SEARCH_PATH_PATTERN.matcher(stripLeadingComments(sql));
+        if (!m.matches()) {
+            return null;
+        }
+        String first = m.group(1).split(",")[0].trim();
+        if (first.length() >= 2 && ((first.startsWith("\"") && first.endsWith("\""))
+                || (first.startsWith("'") && first.endsWith("'")))) {
+            first = first.substring(1, first.length() - 1);
+        }
+        if (first.isEmpty() || first.equalsIgnoreCase("default")) {
+            return null;
+        }
+        return first;
+    }
+    
+    private void handleSessionCommand(String sql) throws SQLException {
+        String schema = extractSchemaFromSessionCommand(sql);
+        if (schema != null) {
+            connection.setSchema(schema);
+        }
     }
     
     /**
