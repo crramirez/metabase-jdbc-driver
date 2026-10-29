@@ -68,6 +68,7 @@ public class MetabaseStatement implements Statement {
     @Override
     public ResultSet executeQuery(String sql) throws SQLException {
         closeCurrentResultSet();
+        rejectMultipleSessionCommandStatements(sql);
         
         if (isSessionCommand(sql)) {
             handleSessionCommand(sql);
@@ -93,6 +94,7 @@ public class MetabaseStatement implements Statement {
     @Override
     public int executeUpdate(String sql) throws SQLException {
         closeCurrentResultSet();
+        rejectMultipleSessionCommandStatements(sql);
         
         if (isSessionCommand(sql)) {
             handleSessionCommand(sql);
@@ -167,6 +169,7 @@ public class MetabaseStatement implements Statement {
     @Override
     public boolean execute(String sql) throws SQLException {        
         closeCurrentResultSet();
+        rejectMultipleSessionCommandStatements(sql);
         
         if (isCustomCommand(sql)) {
             currentResultSet = executeCustomCommand(sql);
@@ -382,9 +385,14 @@ public class MetabaseStatement implements Statement {
      * @throws SQLException If close operation fails
      */
     protected void closeCurrentResultSet() throws SQLException {
-        if (currentResultSet != null && !currentResultSet.isClosed()) {
-            currentResultSet.close();
-            currentResultSet = null;
+        if (currentResultSet != null) {
+            try {
+                if (!currentResultSet.isClosed()) {
+                    currentResultSet.close();
+                }
+            } finally {
+                currentResultSet = null;
+            }
         }
     }
     
@@ -404,7 +412,11 @@ public class MetabaseStatement implements Statement {
     }
     
     private static final java.util.regex.Pattern SESSION_COMMAND_PATTERN = java.util.regex.Pattern.compile(
-        "^(set|reset|use|discard)(\\s.*|;)?$",
+        "^(set|reset|use|discard)(?:\\s+.*)?$",
+        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+
+    private static final java.util.regex.Pattern SESSION_COMMAND_START_PATTERN = java.util.regex.Pattern.compile(
+        "^(set|reset|use|discard)(?:\\s|;|/\\*|--|$).*",
         java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
     
     private static final java.util.regex.Pattern SEARCH_PATH_PATTERN = java.util.regex.Pattern.compile(
@@ -415,18 +427,113 @@ public class MetabaseStatement implements Statement {
      * Strips leading whitespace and SQL comments from a statement.
      */
     static String stripLeadingComments(String sql) {
-        String s = sql.trim();
-        while (true) {
-            if (s.startsWith("--")) {
-                int nl = s.indexOf('\n');
-                s = nl < 0 ? "" : s.substring(nl + 1).trim();
-            } else if (s.startsWith("/*")) {
-                int end = s.indexOf("*/");
-                s = end < 0 ? "" : s.substring(end + 2).trim();
+        if (sql == null) {
+            return "";
+        }
+        int index = 0;
+        while (index < sql.length()) {
+            while (index < sql.length() && Character.isWhitespace(sql.charAt(index))) {
+                index++;
+            }
+            if (sql.startsWith("--", index)) {
+                index += 2;
+                while (index < sql.length() && sql.charAt(index) != '\n' && sql.charAt(index) != '\r') {
+                    index++;
+                }
+            } else if (sql.startsWith("/*", index)) {
+                int depth = 1;
+                index += 2;
+                while (index < sql.length() && depth > 0) {
+                    if (sql.startsWith("/*", index)) {
+                        depth++;
+                        index += 2;
+                    } else if (sql.startsWith("*/", index)) {
+                        depth--;
+                        index += 2;
+                    } else {
+                        index++;
+                    }
+                }
+                if (depth > 0) {
+                    return "";
+                }
             } else {
-                return s;
+                return sql.substring(index).trim();
             }
         }
+        return "";
+    }
+
+    private static String singleStatementWithoutComments(String sql) {
+        if (sql == null) {
+            return null;
+        }
+        StringBuilder statement = new StringBuilder();
+        int blockCommentDepth = 0;
+        boolean lineComment = false;
+        boolean statementEnded = false;
+        char quote = 0;
+
+        for (int i = 0; i < sql.length(); i++) {
+            char current = sql.charAt(i);
+            char next = i + 1 < sql.length() ? sql.charAt(i + 1) : 0;
+
+            if (lineComment) {
+                if (current == '\n' || current == '\r') {
+                    lineComment = false;
+                    statement.append(' ');
+                }
+                continue;
+            }
+            if (blockCommentDepth > 0) {
+                if (current == '/' && next == '*') {
+                    blockCommentDepth++;
+                    i++;
+                } else if (current == '*' && next == '/') {
+                    blockCommentDepth--;
+                    i++;
+                    if (blockCommentDepth == 0) {
+                        statement.append(' ');
+                    }
+                }
+                continue;
+            }
+            if (quote != 0) {
+                statement.append(current);
+                if (current == quote) {
+                    if (next == quote) {
+                        statement.append(next);
+                        i++;
+                    } else {
+                        quote = 0;
+                    }
+                }
+                continue;
+            }
+            if (current == '-' && next == '-') {
+                lineComment = true;
+                i++;
+            } else if (current == '/' && next == '*') {
+                blockCommentDepth = 1;
+                i++;
+            } else if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+                statement.append(current);
+            } else if (current == '[') {
+                quote = ']';
+                statement.append(current);
+            } else if (current == ';') {
+                statementEnded = true;
+            } else if (statementEnded && !Character.isWhitespace(current)) {
+                return null;
+            } else if (!statementEnded) {
+                statement.append(current);
+            }
+        }
+        if (quote != 0 || blockCommentDepth != 0 || statement.toString().trim().isEmpty()) {
+            return null;
+        }
+        return statement.toString().trim();
     }
     
     /**
@@ -440,7 +547,15 @@ public class MetabaseStatement implements Statement {
         if (sql == null) {
             return false;
         }
-        return SESSION_COMMAND_PATTERN.matcher(stripLeadingComments(sql)).matches();
+        String statement = singleStatementWithoutComments(sql);
+        return statement != null && SESSION_COMMAND_PATTERN.matcher(statement).matches();
+    }
+
+    private static void rejectMultipleSessionCommandStatements(String sql) throws SQLException {
+        if (SESSION_COMMAND_START_PATTERN.matcher(stripLeadingComments(sql)).matches()
+                && singleStatementWithoutComments(sql) == null) {
+            throw new SQLException("Multiple SQL statements are not supported.");
+        }
     }
     
     /**
@@ -452,14 +567,58 @@ public class MetabaseStatement implements Statement {
         if (sql == null) {
             return null;
         }
-        java.util.regex.Matcher m = SEARCH_PATH_PATTERN.matcher(stripLeadingComments(sql));
+        String statement = singleStatementWithoutComments(sql);
+        if (statement == null) {
+            return null;
+        }
+        java.util.regex.Matcher m = SEARCH_PATH_PATTERN.matcher(statement);
         if (!m.matches()) {
             return null;
         }
-        String first = m.group(1).split(",")[0].trim();
-        if (first.length() >= 2 && ((first.startsWith("\"") && first.endsWith("\""))
-                || (first.startsWith("'") && first.endsWith("'")))) {
-            first = first.substring(1, first.length() - 1);
+        String values = m.group(1).trim();
+        String first;
+        if (!values.isEmpty() && (values.charAt(0) == '"' || values.charAt(0) == '\'')) {
+            char quote = values.charAt(0);
+            StringBuilder decoded = new StringBuilder();
+            int i = 1;
+            boolean closed = false;
+            while (i < values.length()) {
+                char current = values.charAt(i);
+                if (current == quote) {
+                    if (i + 1 < values.length() && values.charAt(i + 1) == quote) {
+                        decoded.append(quote);
+                        i += 2;
+                    } else {
+                        i++;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    decoded.append(current);
+                    i++;
+                }
+            }
+            while (i < values.length() && Character.isWhitespace(values.charAt(i))) {
+                i++;
+            }
+            if (!closed || (i < values.length() && values.charAt(i) != ',')) {
+                return null;
+            }
+            first = decoded.toString();
+        } else {
+            int comma = values.indexOf(',');
+            int whitespace = -1;
+            for (int i = 0; i < values.length(); i++) {
+                if (Character.isWhitespace(values.charAt(i))) {
+                    whitespace = i;
+                    break;
+                }
+            }
+            int end = comma < 0 ? values.length() : comma;
+            if (whitespace >= 0 && whitespace < end) {
+                end = whitespace;
+            }
+            first = values.substring(0, end).trim();
         }
         if (first.isEmpty() || first.equalsIgnoreCase("default")) {
             return null;
