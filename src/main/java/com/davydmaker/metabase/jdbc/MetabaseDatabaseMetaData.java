@@ -172,6 +172,10 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     
     @Override
     public String getIdentifierQuoteString() throws SQLException {
+        MetabaseDatabase db = apiClient.getDatabaseByName(databaseName);
+        if (db != null && "mysql".equalsIgnoreCase(db.getEngine())) {
+            return "`";
+        }
         return "\"";
     }
     
@@ -357,7 +361,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     
     @Override
     public String getCatalogTerm() throws SQLException {
-        return "catalog";
+        return isSchemaless() ? "database" : "catalog";
     }
     
     @Override
@@ -372,7 +376,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     
     @Override
     public boolean supportsSchemasInDataManipulation() throws SQLException {
-        return true;
+        return !isSchemaless();
     }
     
     @Override
@@ -397,7 +401,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     
     @Override
     public boolean supportsCatalogsInDataManipulation() throws SQLException {
-        return false;
+        return supportsCatalogQualification();
     }
     
     @Override
@@ -407,17 +411,21 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     
     @Override
     public boolean supportsCatalogsInTableDefinitions() throws SQLException {
-        return false;
+        return supportsCatalogQualification();
     }
     
     @Override
     public boolean supportsCatalogsInIndexDefinitions() throws SQLException {
-        return false;
+        return supportsCatalogQualification();
     }
     
     @Override
     public boolean supportsCatalogsInPrivilegeDefinitions() throws SQLException {
-        return false;
+        return supportsCatalogQualification();
+    }
+
+    private boolean supportsCatalogQualification() throws SQLException {
+        return isSchemaless() && apiClient.hasPhysicalCatalogName();
     }
     
     @Override
@@ -729,13 +737,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
         List<List<Object>> rows = new ArrayList<>();
         
         try {
-            List<String> schemas;
-            
-            schemas = apiClient.getSchemas().stream()
-                .filter(schema -> likeMatches(schema, schemaPattern))
-                .collect(Collectors.toList());
-            
-            for (String schema : schemas) {
+            for (String schema : findMatchingSchemas(catalog, schemaPattern)) {
                 try {
                     addTablesFromSchema(schema, tableNamePattern, types, rows);
                 } catch (Exception e) {
@@ -772,6 +774,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
                                    List<List<Object>> rows) throws SQLException {
         try {
             List<MetabaseTableInfo> tables = apiClient.getTables(schemaName);
+            boolean schemaless = isSchemaless();
             
             for (MetabaseTableInfo table : tables) {
                 if (!likeMatches(table.getName(), tableNamePattern)) {
@@ -794,8 +797,8 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
                 }
                 
                 List<Object> row = new ArrayList<>();
-                row.add(null);
-                row.add(table.getSchema());
+                row.add(tableCatalog(schemaless));
+                row.add(tableSchema(table, schemaless));
                 row.add(table.getName());
                 row.add(tableType);
                 row.add(table.getDescription());
@@ -821,9 +824,8 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     @Override
     public ResultSet getSchemas(String catalog, String schemaPattern) throws SQLException {
         try {
-            List<String> schemas = apiClient.getSchemas();
-            
-            schemas = schemas.stream()
+            // Schemaless databases (e.g. MySQL) expose their tables under a catalog instead
+            List<String> schemas = isSchemaless() ? List.of() : apiClient.getSchemas().stream()
                 .filter(schema -> likeMatches(schema, schemaPattern))
                 .collect(Collectors.toList());
             
@@ -849,7 +851,59 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     
     @Override
     public ResultSet getCatalogs() throws SQLException {
-        return createEmptyResultSet();
+        List<List<Object>> rows = new ArrayList<>();
+        if (isSchemaless()) {
+            List<Object> row = new ArrayList<>();
+            row.add(apiClient.getCatalogName());
+            rows.add(row);
+        }
+        
+        List<MetabaseColumnInfo> columns = new ArrayList<>();
+        columns.add(new MetabaseColumnInfo("TABLE_CAT", "TABLE_CAT", "type/Text", null));
+        
+        return new MetabaseResultSet(null, new MetabaseQueryResult(columns, rows));
+    }
+    
+    /**
+     * Returns true when the database has no schemas (e.g. MySQL) and is exposed as a catalog.
+     */
+    private boolean isSchemaless() {
+        try {
+            return apiClient.isSchemaless();
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+    
+    /**
+     * Returns whether the requested catalog refers to this database's catalog.
+     * A null catalog means "do not filter by catalog".
+     */
+    private boolean catalogMatches(String catalog) {
+        return catalog == null
+            || catalog.equalsIgnoreCase(apiClient.getCatalogName())
+            || catalog.equalsIgnoreCase(databaseName);
+    }
+    
+    /**
+     * Returns the Metabase schema names to inspect for the given catalog and schema pattern.
+     * For schemaless databases this is the blank schema, provided the catalog matches.
+     */
+    private List<String> findMatchingSchemas(String catalog, String schemaPattern) throws SQLException {
+        if (isSchemaless()) {
+            return catalogMatches(catalog) ? List.of("") : List.of();
+        }
+        return apiClient.getSchemas().stream()
+            .filter(schema -> likeMatches(schema, schemaPattern))
+            .collect(Collectors.toList());
+    }
+    
+    private String tableCatalog(boolean schemaless) {
+        return schemaless ? apiClient.getCatalogName() : null;
+    }
+    
+    private String tableSchema(MetabaseTableInfo table, boolean schemaless) {
+        return schemaless ? null : table.getSchema();
     }
     
     @Override
@@ -872,8 +926,9 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
         try {
             List<List<Object>> rows = new ArrayList<>();
             
-            for (MetabaseTableInfo table : findSpecificTables(schemaPattern, tableNamePattern)) {
-                addColumnsFromTable(table, columnNamePattern, rows);
+            boolean schemaless = isSchemaless();
+            for (MetabaseTableInfo table : findSpecificTables(catalog, schemaPattern, tableNamePattern)) {
+                addColumnsFromTable(table, columnNamePattern, schemaless, rows);
             }
             
             List<MetabaseColumnInfo> columns = createColumnInfoResultSet();
@@ -891,14 +946,10 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     /**
      * Finds specific tables based on schema and table patterns.
      */
-    private List<MetabaseTableInfo> findSpecificTables(String schemaPattern, String tableNamePattern) throws SQLException {
+    private List<MetabaseTableInfo> findSpecificTables(String catalog, String schemaPattern, String tableNamePattern) throws SQLException {
         List<MetabaseTableInfo> matchingTables = new ArrayList<>();
         
-        List<String> schemas = apiClient.getSchemas().stream()
-            .filter(schema -> likeMatches(schema, schemaPattern))
-            .collect(Collectors.toList());
-        
-        for (String schema : schemas) {
+        for (String schema : findMatchingSchemas(catalog, schemaPattern)) {
             List<MetabaseTableInfo> tables = apiClient.getTables(schema);
             for (MetabaseTableInfo table : tables) {
                 if (likeMatches(table.getName(), tableNamePattern)) {
@@ -947,8 +998,8 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     /**
      * Adds columns from a specific table to the result.
      */
-    private void addColumnsFromTable(MetabaseTableInfo table, 
-                                   String columnNamePattern, List<List<Object>> rows) throws SQLException {
+    private void addColumnsFromTable(MetabaseTableInfo table, String columnNamePattern,
+                                   boolean schemaless, List<List<Object>> rows) throws SQLException {
         try {
             List<MetabaseColumnInfo> columns = apiClient.getTableColumns(table.getId());
             
@@ -964,8 +1015,8 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
                 int jdbcType = column.getJdbcType();
                 
                 List<Object> row = new ArrayList<>();
-                row.add(null);
-                row.add(table.getSchema());
+                row.add(tableCatalog(schemaless));
+                row.add(tableSchema(table, schemaless));
                 row.add(table.getName());
                 row.add(column.getName());
                 row.add(jdbcType);
@@ -1054,7 +1105,19 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
         
         if (table != null && !table.isEmpty()) {
             try {
-                List<MetabaseTableInfo> tables = apiClient.getTables(schema);
+                boolean schemaless = isSchemaless();
+                List<MetabaseTableInfo> tables = new ArrayList<>();
+                if (schemaless) {
+                    if (catalogMatches(catalog)) {
+                        tables.addAll(apiClient.getTables(""));
+                    }
+                } else if (schema != null) {
+                    tables.addAll(apiClient.getTables(schema));
+                } else {
+                    for (String s : apiClient.getSchemas()) {
+                        tables.addAll(apiClient.getTables(s));
+                    }
+                }
                 
                 for (MetabaseTableInfo tableInfo : tables) {
                     if (table.equals(tableInfo.getName()) || table.equals("%")) {
@@ -1064,8 +1127,8 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
                         for (MetabaseColumnInfo column : columns) {
                             if (column.isPrimaryKey()) {
                                 List<Object> row = new ArrayList<>();
-                                row.add(null);
-                                row.add(tableInfo.getSchema());
+                                row.add(tableCatalog(schemaless));
+                                row.add(tableSchema(tableInfo, schemaless));
                                 row.add(tableInfo.getName());
                                 row.add(column.getName());
                                 row.add(keySeq);
@@ -1076,7 +1139,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
                             }
                         }
                         
-                        if (!table.equals("%")) {
+                        if (!table.equals("%") && (schemaless || schema != null)) {
                             break;
                         }
                     }

@@ -214,6 +214,33 @@ public class MetabaseApiClient {
     }
     
     /**
+     * Returns true when the configured database has no schemas, i.e. Metabase only
+     * reports a blank (nil) schema, as for MySQL/MariaDB. Such databases are exposed
+     * through JDBC as a single catalog without schemas.
+     */
+    public boolean isSchemaless() throws SQLException {
+        List<String> schemas = getSchemas();
+        return !schemas.isEmpty() && schemas.stream().allMatch(schema -> schema == null || schema.isEmpty());
+    }
+    
+    /**
+     * Gets the catalog name exposed for a schemaless database: the physical database
+     * name when Metabase exposes it, otherwise the Metabase database name.
+     */
+    public String getCatalogName() {
+        MetabaseDatabase db = getDatabaseByName(currentDatabaseName);
+        if (db != null && db.getPhysicalName() != null) {
+            return db.getPhysicalName();
+        }
+        return currentDatabaseName;
+    }
+
+    public boolean hasPhysicalCatalogName() {
+        MetabaseDatabase db = getDatabaseByName(currentDatabaseName);
+        return db != null && db.getPhysicalName() != null && !db.getPhysicalName().isBlank();
+    }
+    
+    /**
      * Gets tables for specified schema using global cache.
      */
     public List<MetabaseTableInfo> getTables(String schemaName) throws SQLException {

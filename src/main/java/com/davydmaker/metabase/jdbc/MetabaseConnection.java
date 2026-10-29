@@ -50,6 +50,9 @@ public class MetabaseConnection implements Connection {
             apiClient.setSchemaDatabase(databaseName);
             
             List<String> schemas = apiClient.getSchemas();
+            if (apiClient.isSchemaless()) {
+                this.catalog = apiClient.getCatalogName();
+            }
             startBackgroundMetadataLoading(schemas);
             
         } catch (SQLException e) {
