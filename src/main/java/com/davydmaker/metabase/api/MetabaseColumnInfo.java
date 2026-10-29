@@ -137,55 +137,16 @@ public class MetabaseColumnInfo {
 
         // PRIORITY 1: database_type (native database type)
         if (databaseType != null) {
-            String dbType = databaseType.toLowerCase();
-            
             // Checks if it's a PostgreSQL ENUM
             if (isPostgreSQLEnum()) {
                 return Types.VARCHAR; // ENUMs are treated as VARCHAR
             }
 
-            switch (dbType) {
-                case "bool":
-                case "boolean":
-                    return Types.BOOLEAN;
-                case "uuid":
-                    return Types.OTHER; // PostgreSQL UUID as OTHER
-                case "jsonb":
-                case "json":
-                    return Types.OTHER; // PostgreSQL JSON as OTHER (native driver)
-                case "timestamptz":
-                case "timestamp with time zone":
-                    return Types.TIMESTAMP_WITH_TIMEZONE;
-                case "timestamp":
-                case "timestamp without time zone":
-                    return Types.TIMESTAMP;
-                case "varchar":
-                case "text":
-                    return Types.VARCHAR;
-                case "int4":
-                case "integer":
-                    return Types.INTEGER;
-                case "int8":
-                case "bigint":
-                    return Types.BIGINT;
-                case "numeric":
-                case "decimal":
-                    return Types.DECIMAL;
-                case "bytea":
-                    return Types.BLOB;
-                case "date":
-                    return Types.DATE;
-                case "time":
-                    return Types.TIME;
-                case "float4":
-                case "real":
-                    return Types.REAL;
-                case "float8":
-                case "double precision":
-                    return Types.DOUBLE;
-                default: // For other database types (including enums), treat as VARCHAR
-                    return Types.VARCHAR;
+            Integer mapped = mapDatabaseType(normalizeDatabaseType(databaseType));
+            if (mapped != null) {
+                return mapped;
             }
+            // Unknown native type: fall back to Metabase's effective/base type
         }
         
         // PRIORITY 2: effective_type (more precise, used internally by Metabase)
@@ -209,8 +170,9 @@ public class MetabaseColumnInfo {
                 case "type/text":
                     return Types.VARCHAR;
                 case "type/integer":
-                case "type/biginteger":
                     return Types.INTEGER;
+                case "type/biginteger":
+                    return Types.BIGINT;
                 case "type/decimal":
                 case "type/float":
                     return Types.DECIMAL;
@@ -229,6 +191,7 @@ public class MetabaseColumnInfo {
                 case "type/boolean":
                     return Types.BOOLEAN;
                 case "type/biginteger":
+                    return Types.BIGINT;
                 case "type/integer":
                     return Types.INTEGER;
                 case "type/decimal":
@@ -261,10 +224,107 @@ public class MetabaseColumnInfo {
     }
     
     /**
+     * Normalizes a native database type for mapping: lower case, without length/precision
+     * ("varchar(255)" -> "varchar") and MySQL modifiers ("int unsigned" -> "int").
+     */
+    static String normalizeDatabaseType(String databaseType) {
+        String type = databaseType.toLowerCase().replaceAll("\\(.*?\\)", " ");
+        type = type.replaceAll("\\b(unsigned|signed|zerofill)\\b", " ");
+        return type.trim().replaceAll("\\s+", " ");
+    }
+    
+    /**
+     * Maps a normalized native database type (PostgreSQL, MySQL/MariaDB, ...) to a JDBC type.
+     * Returns null for unknown types so callers can fall back to Metabase's types.
+     */
+    private Integer mapDatabaseType(String dbType) {
+        switch (dbType) {
+            case "bool":
+            case "boolean":
+                return Types.BOOLEAN;
+            case "bit":
+                return Types.BIT;
+            case "tinyint":
+                // MySQL tinyint(1) is reported by Metabase as type/Boolean
+                return "type/Boolean".equalsIgnoreCase(baseType) ? Types.BOOLEAN : Types.TINYINT;
+            case "int2":
+            case "smallint":
+            case "smallserial":
+                return Types.SMALLINT;
+            case "int":
+            case "int4":
+            case "integer":
+            case "mediumint":
+            case "serial":
+                return Types.INTEGER;
+            case "int8":
+            case "bigint":
+            case "bigserial":
+                return Types.BIGINT;
+            case "numeric":
+            case "decimal":
+                return Types.DECIMAL;
+            case "float4":
+            case "real":
+            case "float":
+                return Types.REAL;
+            case "float8":
+            case "double":
+            case "double precision":
+                return Types.DOUBLE;
+            case "char":
+            case "bpchar":
+            case "character":
+                return Types.CHAR;
+            case "varchar":
+            case "character varying":
+            case "text":
+            case "tinytext":
+            case "mediumtext":
+            case "longtext":
+            case "enum":
+            case "set":
+                return Types.VARCHAR;
+            case "uuid":
+                return Types.OTHER; // PostgreSQL UUID as OTHER
+            case "jsonb":
+            case "json":
+                return Types.OTHER; // JSON as OTHER (native driver)
+            case "timestamptz":
+            case "timestamp with time zone":
+                return Types.TIMESTAMP_WITH_TIMEZONE;
+            case "timestamp":
+            case "timestamp without time zone":
+            case "datetime":
+                return Types.TIMESTAMP;
+            case "date":
+            case "year":
+                return Types.DATE;
+            case "time":
+            case "time without time zone":
+                return Types.TIME;
+            case "binary":
+                return Types.BINARY;
+            case "varbinary":
+                return Types.VARBINARY;
+            case "bytea":
+            case "blob":
+            case "tinyblob":
+            case "mediumblob":
+            case "longblob":
+                return Types.BLOB;
+            default:
+                return null;
+        }
+    }
+    
+    /**
      * Gets the Java class name corresponding to the column type.
      */
     public String getJavaTypeName() {
         switch (getJdbcType()) {
+            case Types.TINYINT:
+            case Types.SMALLINT:
             case Types.INTEGER:
                 return "java.lang.Integer";
             case Types.BIGINT:
@@ -286,7 +346,11 @@ public class MetabaseColumnInfo {
             case Types.TIME:
                 return "java.sql.Time";
             case Types.BOOLEAN:
+            case Types.BIT:
                 return "java.lang.Boolean";
+            case Types.BINARY:
+            case Types.VARBINARY:
+                return "[B";
             case Types.BLOB:
                 return "java.sql.Blob";
             case Types.OTHER:
@@ -416,7 +480,7 @@ public class MetabaseColumnInfo {
         
         // For PostgreSQL, uses more specific information
         if (databaseType != null) {
-            String dbType = databaseType.toLowerCase();
+            String dbType = normalizeDatabaseType(databaseType);
             switch (dbType) {
                 case "uuid":
                     return 36; // UUIDs have 36 characters
@@ -444,6 +508,10 @@ public class MetabaseColumnInfo {
         
         // Fallback for original logic
         switch (getJdbcType()) {
+            case Types.TINYINT:
+                return 3;
+            case Types.SMALLINT:
+                return 5;
             case Types.INTEGER:
                 return 10;
             case Types.BIGINT:
@@ -451,6 +519,7 @@ public class MetabaseColumnInfo {
             case Types.DECIMAL:
             case Types.DOUBLE:
             case Types.FLOAT:
+            case Types.REAL:
                 return 38;
             case Types.VARCHAR:
             case Types.CHAR:
@@ -464,6 +533,7 @@ public class MetabaseColumnInfo {
             case Types.TIME:
                 return 8;
             case Types.BOOLEAN:
+            case Types.BIT:
                 return 1;
             case Types.OTHER:
                 // For OTHER types (JSON), uses a large size like in PostgreSQL
