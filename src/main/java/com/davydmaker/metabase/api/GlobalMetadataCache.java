@@ -9,6 +9,8 @@ import org.apache.hc.core5.http.ParseException;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 
 import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -260,7 +262,9 @@ public class GlobalMetadataCache {
     
     private void loadTables(Integer databaseId, String schemaName) throws SQLException {
         try {
-            String url = baseUrl + "/api/database/" + databaseId + "/schema/" + schemaName;
+            String encodedSchema = URLEncoder.encode(schemaName == null ? "" : schemaName, StandardCharsets.UTF_8)
+                .replace("+", "%20");
+            String url = baseUrl + "/api/database/" + databaseId + "/schema/" + encodedSchema;
             HttpGet request = new HttpGet(url);
             MetabaseDriverInfo.setStandardHeaders(request);
             request.setHeader("X-Metabase-Session", token);

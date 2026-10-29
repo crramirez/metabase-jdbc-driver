@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Arrays;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -730,11 +731,9 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
         try {
             List<String> schemas;
             
-            if (schemaPattern == null || schemaPattern.isEmpty() || "%".equals(schemaPattern)) {
-                schemas = apiClient.getSchemas();
-            } else {
-                schemas = List.of(schemaPattern);
-            }
+            schemas = apiClient.getSchemas().stream()
+                .filter(schema -> likeMatches(schema, schemaPattern))
+                .collect(Collectors.toList());
             
             for (String schema : schemas) {
                 try {
@@ -775,11 +774,8 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
             List<MetabaseTableInfo> tables = apiClient.getTables(schemaName);
             
             for (MetabaseTableInfo table : tables) {
-                if (tableNamePattern != null && !tableNamePattern.isEmpty() && !"%".equals(tableNamePattern)) {
-                    String pattern = tableNamePattern.replace("%", ".*").replace("_", ".");
-                    if (!table.getName().matches(pattern)) {
-                        continue;
-                    }
+                if (!likeMatches(table.getName(), tableNamePattern)) {
+                    continue;
                 }
                 
                 String tableType = "TABLE";
@@ -827,12 +823,9 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
         try {
             List<String> schemas = apiClient.getSchemas();
             
-            if (schemaPattern != null && !schemaPattern.isEmpty() && !"%".equals(schemaPattern)) {
-                String pattern = schemaPattern.replace("%", ".*").replace("_", ".");
-                schemas = schemas.stream()
-                    .filter(schema -> schema.matches(pattern))
-                    .collect(Collectors.toList());
-            }
+            schemas = schemas.stream()
+                .filter(schema -> likeMatches(schema, schemaPattern))
+                .collect(Collectors.toList());
             
             List<List<Object>> rows = new ArrayList<>();
             for (String schema : schemas) {
@@ -879,41 +872,8 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
         try {
             List<List<Object>> rows = new ArrayList<>();
             
-            if (schemaPattern != null && !schemaPattern.isEmpty() && !"%".equals(schemaPattern) &&
-                tableNamePattern != null && !tableNamePattern.isEmpty() && !"%".equals(tableNamePattern)) {
-                
-                List<MetabaseTableInfo> matchingTables = findSpecificTables(schemaPattern, tableNamePattern);
-                for (MetabaseTableInfo table : matchingTables) {
-                    addColumnsFromTable(table, columnNamePattern, rows);
-                }
-                
-            } else if (schemaPattern != null && !schemaPattern.isEmpty() && !"%".equals(schemaPattern)) {
-                
-                String pattern = schemaPattern.replace("%", ".*").replace("_", ".");
-                List<String> schemas = apiClient.getSchemas().stream()
-                    .filter(schema -> schema.matches(pattern))
-                    .collect(Collectors.toList());
-                
-                for (String schema : schemas.subList(0, Math.min(schemas.size(), 1))) {
-                    List<MetabaseTableInfo> tables = apiClient.getTables(schema);
-                    for (MetabaseTableInfo table : tables.subList(0, Math.min(tables.size(), 3))) {
-                        if (matchesTablePattern(table.getName(), tableNamePattern)) {
-                            addColumnsFromTable(table, columnNamePattern, rows);
-                        }
-                    }
-                }
-                
-            } else {
-                
-                List<String> schemas = apiClient.getSchemas();
-                for (String schema : schemas.subList(0, Math.min(schemas.size(), 1))) {
-                    List<MetabaseTableInfo> tables = apiClient.getTables(schema);
-                    for (MetabaseTableInfo table : tables.subList(0, Math.min(tables.size(), 2))) {
-                        if (matchesTablePattern(table.getName(), tableNamePattern)) {
-                            addColumnsFromTable(table, columnNamePattern, rows);
-                        }
-                    }
-                }
+            for (MetabaseTableInfo table : findSpecificTables(schemaPattern, tableNamePattern)) {
+                addColumnsFromTable(table, columnNamePattern, rows);
             }
             
             List<MetabaseColumnInfo> columns = createColumnInfoResultSet();
@@ -934,17 +894,14 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     private List<MetabaseTableInfo> findSpecificTables(String schemaPattern, String tableNamePattern) throws SQLException {
         List<MetabaseTableInfo> matchingTables = new ArrayList<>();
         
-        String schemaRegex = schemaPattern.replace("%", ".*").replace("_", ".");
-        String tableRegex = tableNamePattern.replace("%", ".*").replace("_", ".");
-        
         List<String> schemas = apiClient.getSchemas().stream()
-            .filter(schema -> schema.matches(schemaRegex))
+            .filter(schema -> likeMatches(schema, schemaPattern))
             .collect(Collectors.toList());
         
         for (String schema : schemas) {
             List<MetabaseTableInfo> tables = apiClient.getTables(schema);
             for (MetabaseTableInfo table : tables) {
-                if (table.getName().matches(tableRegex)) {
+                if (likeMatches(table.getName(), tableNamePattern)) {
                     matchingTables.add(table);
                 }
             }
@@ -954,14 +911,37 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     }
     
     /**
-     * Checks if a table name matches the pattern.
+     * Matches a value against a JDBC LIKE-style pattern ('%', '_'), honoring the
+     * search string escape ('\\') returned by {@link #getSearchStringEscape()}.
+     * A null or empty pattern matches everything.
      */
-    private boolean matchesTablePattern(String tableName, String tableNamePattern) {
-        if (tableNamePattern == null || tableNamePattern.isEmpty() || "%".equals(tableNamePattern)) {
+    static boolean likeMatches(String value, String pattern) {
+        if (pattern == null || pattern.isEmpty() || "%".equals(pattern)) {
             return true;
         }
-        String pattern = tableNamePattern.replace("%", ".*").replace("_", ".");
-        return tableName.matches(pattern);
+        if (value == null) {
+            return false;
+        }
+        StringBuilder regex = new StringBuilder();
+        StringBuilder literal = new StringBuilder();
+        for (int i = 0; i < pattern.length(); i++) {
+            char c = pattern.charAt(i);
+            if (c == '\\' && i + 1 < pattern.length()) {
+                literal.append(pattern.charAt(++i));
+            } else if (c == '%' || c == '_') {
+                if (literal.length() > 0) {
+                    regex.append(Pattern.quote(literal.toString()));
+                    literal.setLength(0);
+                }
+                regex.append(c == '%' ? ".*" : ".");
+            } else {
+                literal.append(c);
+            }
+        }
+        if (literal.length() > 0) {
+            regex.append(Pattern.quote(literal.toString()));
+        }
+        return Pattern.compile(regex.toString(), Pattern.DOTALL).matcher(value).matches();
     }
     
     /**
@@ -975,8 +955,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
             int ordinalPosition = 1;
             for (MetabaseColumnInfo column : columns) {
                 if (columnNamePattern != null && !columnNamePattern.isEmpty() && !"%".equals(columnNamePattern)) {
-                    String pattern = columnNamePattern.replace("%", ".*").replace("_", ".");
-                    if (!column.getName().matches(pattern)) {
+                    if (!likeMatches(column.getName(), columnNamePattern)) {
                         continue;
                     }
                 }
