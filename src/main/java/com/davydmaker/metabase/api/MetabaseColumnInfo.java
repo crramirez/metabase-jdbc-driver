@@ -144,6 +144,26 @@ public class MetabaseColumnInfo {
 
             Integer mapped = mapDatabaseType(normalizeDatabaseType(databaseType));
             if (mapped != null) {
+                if (isUnsignedDatabaseType()) {
+                    switch (normalizeDatabaseType(databaseType)) {
+                        case "tinyint":
+                            return Types.SMALLINT;
+                        case "smallint":
+                            return Types.INTEGER;
+                        case "int":
+                        case "int4":
+                        case "integer":
+                            return Types.BIGINT;
+                        case "bigint":
+                        case "int8":
+                            return Types.DECIMAL;
+                        default:
+                            break;
+                    }
+                }
+                if (mapped == Types.BIT && getBitWidth() > 1) {
+                    return Types.VARCHAR;
+                }
                 return mapped;
             }
             // Unknown native type: fall back to Metabase's effective/base type
@@ -232,6 +252,32 @@ public class MetabaseColumnInfo {
         type = type.replaceAll("\\b(unsigned|signed|zerofill)\\b", " ");
         return type.trim().replaceAll("\\s+", " ");
     }
+
+    boolean isUnsignedDatabaseType() {
+        return databaseType != null && databaseType.toLowerCase().matches(".*\\bunsigned\\b.*");
+    }
+
+    private int getBitWidth() {
+        if (databaseType == null) {
+            return -1;
+        }
+        String normalizedType = normalizeDatabaseType(databaseType);
+        boolean fixedBit = "bit".equals(normalizedType);
+        if (!fixedBit && !"bit varying".equals(normalizedType) &&
+                !"varying bit".equals(normalizedType)) {
+            return -1;
+        }
+        int open = databaseType.indexOf('(');
+        int close = open < 0 ? -1 : databaseType.indexOf(')', open + 1);
+        if (close < 0) {
+            return fixedBit ? 1 : -1;
+        }
+        try {
+            return Integer.parseInt(databaseType.substring(open + 1, close).trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
     
     /**
      * Maps a normalized native database type (PostgreSQL, MySQL/MariaDB, ...) to a JDBC type.
@@ -244,6 +290,9 @@ public class MetabaseColumnInfo {
                 return Types.BOOLEAN;
             case "bit":
                 return Types.BIT;
+            case "bit varying":
+            case "varying bit":
+                return Types.VARCHAR;
             case "tinyint":
                 // MySQL tinyint(1) is reported by Metabase as type/Boolean
                 return "type/Boolean".equalsIgnoreCase(baseType) ? Types.BOOLEAN : Types.TINYINT;
@@ -350,7 +399,7 @@ public class MetabaseColumnInfo {
                 return "java.lang.Boolean";
             case Types.BINARY:
             case Types.VARBINARY:
-                return "[B";
+                return "java.lang.String";
             case Types.BLOB:
                 return "java.sql.Blob";
             case Types.OTHER:
@@ -481,6 +530,28 @@ public class MetabaseColumnInfo {
         // For PostgreSQL, uses more specific information
         if (databaseType != null) {
             String dbType = normalizeDatabaseType(databaseType);
+            if (isUnsignedDatabaseType()) {
+                switch (dbType) {
+                    case "tinyint":
+                        return 3;
+                    case "smallint":
+                        return 5;
+                    case "mediumint":
+                        return 8;
+                    case "int":
+                    case "int4":
+                    case "integer":
+                        return 10;
+                    case "bigint":
+                    case "int8":
+                        return 20;
+                    default:
+                        break;
+                }
+            }
+            if (getBitWidth() > 0) {
+                return getBitWidth();
+            }
             switch (dbType) {
                 case "uuid":
                     return 36; // UUIDs have 36 characters
@@ -547,6 +618,11 @@ public class MetabaseColumnInfo {
      * Gets the number of decimal digits (used in ResultSetMetaData).
      */
     public int getDecimalDigits() {
+        if (isUnsignedDatabaseType() &&
+                ("bigint".equals(normalizeDatabaseType(databaseType)) ||
+                 "int8".equals(normalizeDatabaseType(databaseType)))) {
+            return 0;
+        }
         switch (getJdbcType()) {
             case Types.DECIMAL:
             case Types.DOUBLE:

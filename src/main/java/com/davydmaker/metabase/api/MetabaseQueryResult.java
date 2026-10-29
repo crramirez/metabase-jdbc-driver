@@ -494,6 +494,33 @@ public class MetabaseQueryResult {
             if ("timestamptz".equals(dbType) && node.isTextual()) {
                 return convertTimestampWithTimezone(node.textValue());
             }
+            String normalizedType = MetabaseColumnInfo.normalizeDatabaseType(dbType);
+            if ("datetime".equals(normalizedType) && node.isTextual()) {
+                return convertTimestampWithoutTimezone(node.textValue());
+            }
+            if ("bit".equals(normalizedType)) {
+                int width = bitWidth(dbType);
+                if (width <= 1) {
+                    String bitValue = node.asText();
+                    if ("1".equals(bitValue) || "true".equalsIgnoreCase(bitValue)) {
+                        return true;
+                    }
+                    if ("0".equals(bitValue) || "false".equalsIgnoreCase(bitValue)) {
+                        return false;
+                    }
+                } else if (node.isValueNode()) {
+                    return node.asText();
+                }
+            }
+            if (columnInfo.isUnsignedDatabaseType() && node.isNumber()) {
+                if ("int".equals(normalizedType) || "int4".equals(normalizedType) ||
+                        "integer".equals(normalizedType)) {
+                    return node.longValue();
+                }
+                if ("bigint".equals(normalizedType) || "int8".equals(normalizedType)) {
+                    return new java.math.BigDecimal(node.asText());
+                }
+            }
         }
         
         return convertJsonValue(node);
@@ -545,4 +572,27 @@ public class MetabaseQueryResult {
             return utcTimestamp;
         }
     }
-} 
+
+    private static Object convertTimestampWithoutTimezone(String timestamp) {
+        try {
+            java.time.LocalDateTime localDateTime =
+                    java.time.LocalDateTime.parse(timestamp.replace(' ', 'T'));
+            return java.sql.Timestamp.valueOf(localDateTime);
+        } catch (java.time.format.DateTimeParseException e) {
+            return timestamp;
+        }
+    }
+
+    private static int bitWidth(String databaseType) {
+        int open = databaseType.indexOf('(');
+        int close = open < 0 ? -1 : databaseType.indexOf(')', open + 1);
+        if (close < 0) {
+            return 1;
+        }
+        try {
+            return Integer.parseInt(databaseType.substring(open + 1, close).trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+}
