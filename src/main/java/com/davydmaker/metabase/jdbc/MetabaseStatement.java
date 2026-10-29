@@ -422,6 +422,9 @@ public class MetabaseStatement implements Statement {
     private static final java.util.regex.Pattern SEARCH_PATH_PATTERN = java.util.regex.Pattern.compile(
         "^set\\s+(?:(?:session|local)\\s+)?(?:search_path\\s*(?:=|\\s+to\\s+)|schema\\s+)(.+?)\\s*;?$",
         java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+
+    private static final java.util.regex.Pattern DOLLAR_QUOTE_DELIMITER_PATTERN = java.util.regex.Pattern.compile(
+        "\\$(?:[A-Za-z_][A-Za-z0-9_]*)?\\$");
     
     /**
      * Strips leading whitespace and SQL comments from a statement.
@@ -473,11 +476,22 @@ public class MetabaseStatement implements Statement {
         boolean lineComment = false;
         boolean statementEnded = false;
         char quote = 0;
+        String dollarQuoteDelimiter = null;
 
         for (int i = 0; i < sql.length(); i++) {
             char current = sql.charAt(i);
             char next = i + 1 < sql.length() ? sql.charAt(i + 1) : 0;
 
+            if (dollarQuoteDelimiter != null) {
+                if (sql.startsWith(dollarQuoteDelimiter, i)) {
+                    statement.append(dollarQuoteDelimiter);
+                    i += dollarQuoteDelimiter.length() - 1;
+                    dollarQuoteDelimiter = null;
+                } else {
+                    statement.append(current);
+                }
+                continue;
+            }
             if (lineComment) {
                 if (current == '\n' || current == '\r') {
                     lineComment = false;
@@ -516,6 +530,9 @@ public class MetabaseStatement implements Statement {
             } else if (current == '/' && next == '*') {
                 blockCommentDepth = 1;
                 i++;
+            } else if (current == '$' && (dollarQuoteDelimiter = dollarQuoteDelimiterAt(sql, i)) != null) {
+                statement.append(dollarQuoteDelimiter);
+                i += dollarQuoteDelimiter.length() - 1;
             } else if (current == '\'' || current == '"' || current == '`') {
                 quote = current;
                 statement.append(current);
@@ -530,10 +547,16 @@ public class MetabaseStatement implements Statement {
                 statement.append(current);
             }
         }
-        if (quote != 0 || blockCommentDepth != 0 || statement.toString().trim().isEmpty()) {
+        if (quote != 0 || dollarQuoteDelimiter != null || blockCommentDepth != 0 || statement.toString().trim().isEmpty()) {
             return null;
         }
         return statement.toString().trim();
+    }
+
+    private static String dollarQuoteDelimiterAt(String sql, int index) {
+        java.util.regex.Matcher matcher = DOLLAR_QUOTE_DELIMITER_PATTERN.matcher(sql);
+        matcher.region(index, sql.length());
+        return matcher.lookingAt() ? matcher.group() : null;
     }
     
     /**
@@ -577,7 +600,21 @@ public class MetabaseStatement implements Statement {
         }
         String values = m.group(1).trim();
         String first;
-        if (!values.isEmpty() && (values.charAt(0) == '"' || values.charAt(0) == '\'')) {
+        String dollarQuoteDelimiter = dollarQuoteDelimiterAt(values, 0);
+        if (dollarQuoteDelimiter != null) {
+            int closingDelimiter = values.indexOf(dollarQuoteDelimiter, dollarQuoteDelimiter.length());
+            if (closingDelimiter < 0) {
+                return null;
+            }
+            int remainder = closingDelimiter + dollarQuoteDelimiter.length();
+            while (remainder < values.length() && Character.isWhitespace(values.charAt(remainder))) {
+                remainder++;
+            }
+            if (remainder < values.length() && values.charAt(remainder) != ',') {
+                return null;
+            }
+            first = values.substring(dollarQuoteDelimiter.length(), closingDelimiter);
+        } else if (!values.isEmpty() && (values.charAt(0) == '"' || values.charAt(0) == '\'')) {
             char quote = values.charAt(0);
             StringBuilder decoded = new StringBuilder();
             int i = 1;

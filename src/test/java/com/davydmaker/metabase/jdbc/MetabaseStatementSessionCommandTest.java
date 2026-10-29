@@ -21,6 +21,8 @@ class MetabaseStatementSessionCommandTest {
         assertTrue(MetabaseStatement.isSessionCommand("discard all"));
         assertTrue(MetabaseStatement.isSessionCommand("SET search_path = 'a;b' -- trailing ; comment"));
         assertTrue(MetabaseStatement.isSessionCommand("SET search_path = \"a;b\""));
+        assertTrue(MetabaseStatement.isSessionCommand("SET application_name = $$a;b$$"));
+        assertTrue(MetabaseStatement.isSessionCommand("SET application_name = $tag$a;b$tag$"));
 
         assertFalse(MetabaseStatement.isSessionCommand("select * from settings"));
         assertFalse(MetabaseStatement.isSessionCommand("settings"));
@@ -41,6 +43,10 @@ class MetabaseStatementSessionCommandTest {
             "SET search_path = \"sales\"\"west\", public"));
         assertEquals("public", MetabaseStatement.extractSchemaFromSessionCommand(
             "SET search_path = \"public\"; -- selected"));
+        assertEquals("public", MetabaseStatement.extractSchemaFromSessionCommand(
+            "SET search_path = $$public$$"));
+        assertEquals("sales,west", MetabaseStatement.extractSchemaFromSessionCommand(
+            "SET search_path = $schema$sales,west$schema$, public"));
         assertNull(MetabaseStatement.extractSchemaFromSessionCommand("set search_path to default"));
         assertNull(MetabaseStatement.extractSchemaFromSessionCommand("set timezone = 'UTC'"));
         assertNull(MetabaseStatement.extractSchemaFromSessionCommand("SET search_path TO public; SELECT 1"));
