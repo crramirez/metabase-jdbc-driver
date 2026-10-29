@@ -219,8 +219,11 @@ public class GlobalMetadataCache {
                     Integer id = dbNode.get("id").asInt();
                     String name = dbNode.get("name").asText();
                     String engine = dbNode.has("engine") ? dbNode.get("engine").asText() : "unknown";
+                    JsonNode dbNameNode = dbNode.path("details").path("dbname");
+                    String physicalName = dbNameNode.isTextual() && !dbNameNode.asText().isBlank()
+                        ? dbNameNode.asText() : null;
                     
-                    databaseList.add(new MetabaseDatabase(id, name, engine));
+                    databaseList.add(new MetabaseDatabase(id, name, engine, physicalName));
                 }
                 
                 this.databases = databaseList;
@@ -249,7 +252,8 @@ public class GlobalMetadataCache {
                 List<String> schemas = new ArrayList<>();
                 if (jsonArray.isArray()) {
                     for (JsonNode schemaNode : jsonArray) {
-                        schemas.add(schemaNode.asText());
+                        // Schemaless databases (e.g. MySQL) report their tables' nil schema as null or ""
+                        schemas.add(schemaNode.isNull() ? "" : schemaNode.asText());
                     }
                 }
                 
@@ -357,14 +361,14 @@ public class GlobalMetadataCache {
     }
     
     private String buildTablesCacheKey(Integer databaseId, String schemaName) {
-        return databaseId + ":" + schemaName;
+        return databaseId + ":" + (schemaName == null ? "" : schemaName);
     }
     
     private MetabaseTableInfo parseTableFromJson(JsonNode tableNode) {
         Integer id = tableNode.get("id").asInt();
         String name = tableNode.get("name").asText();
         String displayName = tableNode.has("display_name") ? tableNode.get("display_name").asText() : name;
-        String schema = tableNode.has("schema") ? tableNode.get("schema").asText() : "";
+        String schema = tableNode.hasNonNull("schema") ? tableNode.get("schema").asText() : "";
         String entityType = tableNode.has("entity_type") && !tableNode.get("entity_type").isNull() ? 
                            tableNode.get("entity_type").asText() : null;
         String description = tableNode.has("description") && !tableNode.get("description").isNull() ? 

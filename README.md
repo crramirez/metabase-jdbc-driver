@@ -203,6 +203,17 @@ The driver implements intelligent metadata caching to reduce API calls:
 - **Column information**: Single API call loads both names and details
 - **Automatic refresh**: Cache refreshes when expired
 
+### Schemaless Databases (MySQL, MariaDB, ...)
+
+Some databases have no schemas; Metabase reports their tables with a blank schema.
+For these, the driver behaves like MySQL Connector/J: the database is exposed as a single
+JDBC **catalog** with no schemas, so tools such as IntelliJ IDEA/DataGrip can browse it.
+
+- The catalog name is the physical database name (`details.dbname`) when Metabase exposes it
+  (admin users), otherwise the Metabase database name.
+- For MySQL, identifiers are quoted with backticks.
+- `Statement.setFetchSize(Integer.MIN_VALUE)` (MySQL streaming hint used by IntelliJ) is accepted and ignored.
+
 ## Troubleshooting
 
 ### Common Issues

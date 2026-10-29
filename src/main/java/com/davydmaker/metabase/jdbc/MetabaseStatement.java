@@ -207,8 +207,10 @@ public class MetabaseStatement implements Statement {
     
     @Override
     public void setFetchSize(int rows) throws SQLException {
+        // Fetch size is only a hint. MySQL clients (e.g. IntelliJ/DataGrip) pass
+        // Integer.MIN_VALUE to request row streaming, so negative values are ignored.
         if (rows < 0) {
-            throw new SQLException("Fetch size must be >= 0");
+            rows = 0;
         }
         this.fetchSize = rows;
     }
