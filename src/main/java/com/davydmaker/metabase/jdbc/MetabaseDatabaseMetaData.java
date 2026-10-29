@@ -401,7 +401,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     
     @Override
     public boolean supportsCatalogsInDataManipulation() throws SQLException {
-        return isSchemaless();
+        return supportsCatalogQualification();
     }
     
     @Override
@@ -411,17 +411,21 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
     
     @Override
     public boolean supportsCatalogsInTableDefinitions() throws SQLException {
-        return isSchemaless();
+        return supportsCatalogQualification();
     }
     
     @Override
     public boolean supportsCatalogsInIndexDefinitions() throws SQLException {
-        return isSchemaless();
+        return supportsCatalogQualification();
     }
     
     @Override
     public boolean supportsCatalogsInPrivilegeDefinitions() throws SQLException {
-        return isSchemaless();
+        return supportsCatalogQualification();
+    }
+
+    private boolean supportsCatalogQualification() throws SQLException {
+        return isSchemaless() && apiClient.hasPhysicalCatalogName();
     }
     
     @Override
@@ -1135,7 +1139,7 @@ public class MetabaseDatabaseMetaData implements DatabaseMetaData {
                             }
                         }
                         
-                        if (!table.equals("%")) {
+                        if (!table.equals("%") && (schemaless || schema != null)) {
                             break;
                         }
                     }

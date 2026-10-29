@@ -219,7 +219,8 @@ public class MetabaseApiClient {
      * through JDBC as a single catalog without schemas.
      */
     public boolean isSchemaless() throws SQLException {
-        return getSchemas().stream().allMatch(schema -> schema == null || schema.isEmpty());
+        List<String> schemas = getSchemas();
+        return !schemas.isEmpty() && schemas.stream().allMatch(schema -> schema == null || schema.isEmpty());
     }
     
     /**
@@ -232,6 +233,11 @@ public class MetabaseApiClient {
             return db.getPhysicalName();
         }
         return currentDatabaseName;
+    }
+
+    public boolean hasPhysicalCatalogName() {
+        MetabaseDatabase db = getDatabaseByName(currentDatabaseName);
+        return db != null && db.getPhysicalName() != null && !db.getPhysicalName().isBlank();
     }
     
     /**
