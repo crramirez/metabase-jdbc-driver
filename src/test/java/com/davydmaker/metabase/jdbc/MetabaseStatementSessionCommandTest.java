@@ -1,6 +1,7 @@
 package com.davydmaker.metabase.jdbc;
 
 import com.davydmaker.metabase.api.MetabaseApiClient;
+import com.davydmaker.metabase.api.MetabaseDatabase;
 import com.davydmaker.metabase.api.MetabaseQueryResult;
 import org.junit.jupiter.api.Test;
 
@@ -65,6 +66,36 @@ class MetabaseStatementSessionCommandTest {
             verify(connection, never()).setSchema(anyString());
             stmt.close();
         }
+    }
+
+    @Test
+    void recognizesBackslashEscapesByDialectAndPrefix() {
+        assertTrue(MetabaseStatement.isSessionCommand("SET application_name = E'can\\'t'"));
+        assertTrue(MetabaseStatement.isSessionCommand("SET application_name = e'a\\';b'"));
+        assertFalse(MetabaseStatement.isSessionCommand("SET application_name = 'can\\'t'"));
+        assertFalse(MetabaseStatement.isSessionCommand("SET search_path TO 'public\\'; SELECT ''", false));
+        assertTrue(MetabaseStatement.isSessionCommand("SET @v = 'can\\'t'", true));
+        assertTrue(MetabaseStatement.isSessionCommand("SET @v = \"a\\\";b\"", true));
+    }
+
+    @Test
+    void forwardsMariaDbSetStatementWithBackslashEscapedLiteral() throws Exception {
+        String sql = "SET STATEMENT max_statement_time=1 FOR SELECT 'can\\'t'";
+        MetabaseApiClient apiClient = mock(MetabaseApiClient.class);
+        MetabaseConnection connection = mock(MetabaseConnection.class);
+        MetabaseStatement stmt = new MetabaseStatement(connection, apiClient, "db");
+        when(apiClient.getDatabaseByName("db")).thenReturn(new MetabaseDatabase(1, "db", "mysql"));
+        when(apiClient.executeQuery(sql, "db")).thenAnswer(invocation -> new MetabaseQueryResult(
+            Collections.emptyList(), Collections.singletonList(Collections.singletonList("can't"))));
+
+        assertTrue(stmt.execute(sql));
+        try (ResultSet rs = stmt.executeQuery(sql)) {
+            assertTrue(rs.next());
+        }
+        verify(apiClient, times(2)).executeQuery(sql, "db");
+
+        MetabaseStatement postgresStmt = new MetabaseStatement(connection, mock(MetabaseApiClient.class), "db");
+        assertThrows(java.sql.SQLException.class, () -> postgresStmt.execute(sql));
     }
 
     @Test

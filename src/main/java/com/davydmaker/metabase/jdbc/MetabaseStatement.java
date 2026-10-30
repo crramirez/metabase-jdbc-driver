@@ -68,10 +68,11 @@ public class MetabaseStatement implements Statement {
     @Override
     public ResultSet executeQuery(String sql) throws SQLException {
         closeCurrentResultSet();
-        rejectMultipleSessionCommandStatements(sql);
+        boolean backslashEscapes = usesBackslashEscapes();
+        rejectMultipleSessionCommandStatements(sql, backslashEscapes);
         
-        if (isSessionCommand(sql)) {
-            handleSessionCommand(sql);
+        if (isSessionCommand(sql, backslashEscapes)) {
+            handleSessionCommand(sql, backslashEscapes);
             currentResultSet = new MetabaseResultSet(this,
                 new MetabaseQueryResult(new ArrayList<>(), new ArrayList<>()));
             updateCount = -1;
@@ -94,10 +95,11 @@ public class MetabaseStatement implements Statement {
     @Override
     public int executeUpdate(String sql) throws SQLException {
         closeCurrentResultSet();
-        rejectMultipleSessionCommandStatements(sql);
+        boolean backslashEscapes = usesBackslashEscapes();
+        rejectMultipleSessionCommandStatements(sql, backslashEscapes);
         
-        if (isSessionCommand(sql)) {
-            handleSessionCommand(sql);
+        if (isSessionCommand(sql, backslashEscapes)) {
+            handleSessionCommand(sql, backslashEscapes);
             updateCount = 0;
             return 0;
         }
@@ -169,7 +171,8 @@ public class MetabaseStatement implements Statement {
     @Override
     public boolean execute(String sql) throws SQLException {        
         closeCurrentResultSet();
-        rejectMultipleSessionCommandStatements(sql);
+        boolean backslashEscapes = usesBackslashEscapes();
+        rejectMultipleSessionCommandStatements(sql, backslashEscapes);
         
         if (isCustomCommand(sql)) {
             currentResultSet = executeCustomCommand(sql);
@@ -177,8 +180,8 @@ public class MetabaseStatement implements Statement {
             return true;
         }
         
-        if (isSessionCommand(sql)) {
-            handleSessionCommand(sql);
+        if (isSessionCommand(sql, backslashEscapes)) {
+            handleSessionCommand(sql, backslashEscapes);
             updateCount = 0;
             return false;
         }
@@ -467,7 +470,34 @@ public class MetabaseStatement implements Statement {
         return "";
     }
 
-    private static String singleStatementWithoutComments(String sql) {
+    /**
+     * MySQL/MariaDB treat backslash as an escape character inside string literals.
+     */
+    private boolean usesBackslashEscapes() {
+        if (apiClient == null) {
+            return false;
+        }
+        MetabaseDatabase db = apiClient.getDatabaseByName(databaseName);
+        return db != null && db.getEngine() != null
+            && ("mysql".equalsIgnoreCase(db.getEngine()) || "mariadb".equalsIgnoreCase(db.getEngine()));
+    }
+
+    private static boolean isEscapeStringPrefix(String sql, int quoteIndex) {
+        if (quoteIndex < 1) {
+            return false;
+        }
+        char prefix = sql.charAt(quoteIndex - 1);
+        if (prefix != 'E' && prefix != 'e') {
+            return false;
+        }
+        if (quoteIndex < 2) {
+            return true;
+        }
+        char beforePrefix = sql.charAt(quoteIndex - 2);
+        return !(Character.isLetterOrDigit(beforePrefix) || beforePrefix == '_' || beforePrefix == '$');
+    }
+
+    private static String singleStatementWithoutComments(String sql, boolean backslashEscapes) {
         if (sql == null) {
             return null;
         }
@@ -476,6 +506,7 @@ public class MetabaseStatement implements Statement {
         boolean lineComment = false;
         boolean statementEnded = false;
         char quote = 0;
+        boolean quoteBackslashEscapes = false;
         String dollarQuoteDelimiter = null;
 
         for (int i = 0; i < sql.length(); i++) {
@@ -514,7 +545,10 @@ public class MetabaseStatement implements Statement {
             }
             if (quote != 0) {
                 statement.append(current);
-                if (current == quote) {
+                if (quoteBackslashEscapes && current == '\\' && next != 0) {
+                    statement.append(next);
+                    i++;
+                } else if (current == quote) {
                     if (next == quote) {
                         statement.append(next);
                         i++;
@@ -535,9 +569,12 @@ public class MetabaseStatement implements Statement {
                 i += dollarQuoteDelimiter.length() - 1;
             } else if (current == '\'' || current == '"' || current == '`') {
                 quote = current;
+                quoteBackslashEscapes = current != '`'
+                    && (backslashEscapes || (current == '\'' && isEscapeStringPrefix(sql, i)));
                 statement.append(current);
             } else if (current == '[') {
                 quote = ']';
+                quoteBackslashEscapes = false;
                 statement.append(current);
             } else if (current == ';') {
                 statementEnded = true;
@@ -568,16 +605,21 @@ public class MetabaseStatement implements Statement {
      * MariaDB SET STATEMENT wraps a query and must be executed remotely instead.
      */
     static boolean isSessionCommand(String sql) {
+        return isSessionCommand(sql, false);
+    }
+
+    static boolean isSessionCommand(String sql, boolean backslashEscapes) {
         if (sql == null) {
             return false;
         }
-        String statement = singleStatementWithoutComments(sql);
+        String statement = singleStatementWithoutComments(sql, backslashEscapes);
         return statement != null && SESSION_COMMAND_PATTERN.matcher(statement).matches();
     }
 
-    private static void rejectMultipleSessionCommandStatements(String sql) throws SQLException {
+    private static void rejectMultipleSessionCommandStatements(String sql, boolean backslashEscapes)
+            throws SQLException {
         if (SESSION_COMMAND_START_PATTERN.matcher(stripLeadingComments(sql)).matches()
-                && singleStatementWithoutComments(sql) == null) {
+                && singleStatementWithoutComments(sql, backslashEscapes) == null) {
             throw new SQLException("Multiple SQL statements are not supported.");
         }
     }
@@ -588,10 +630,14 @@ public class MetabaseStatement implements Statement {
      * @return schema name, or null if the statement does not set a schema
      */
     static String extractSchemaFromSessionCommand(String sql) {
+        return extractSchemaFromSessionCommand(sql, false);
+    }
+
+    static String extractSchemaFromSessionCommand(String sql, boolean backslashEscapes) {
         if (sql == null) {
             return null;
         }
-        String statement = singleStatementWithoutComments(sql);
+        String statement = singleStatementWithoutComments(sql, backslashEscapes);
         if (statement == null) {
             return null;
         }
@@ -664,8 +710,8 @@ public class MetabaseStatement implements Statement {
         return first;
     }
     
-    private void handleSessionCommand(String sql) throws SQLException {
-        String schema = extractSchemaFromSessionCommand(sql);
+    private void handleSessionCommand(String sql, boolean backslashEscapes) throws SQLException {
+        String schema = extractSchemaFromSessionCommand(sql, backslashEscapes);
         if (schema != null) {
             connection.setSchema(schema);
         }
