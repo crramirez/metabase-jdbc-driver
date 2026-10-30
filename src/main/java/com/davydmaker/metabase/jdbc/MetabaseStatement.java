@@ -68,6 +68,16 @@ public class MetabaseStatement implements Statement {
     @Override
     public ResultSet executeQuery(String sql) throws SQLException {
         closeCurrentResultSet();
+        boolean backslashEscapes = usesBackslashEscapes();
+        rejectMultipleSessionCommandStatements(sql, backslashEscapes);
+        
+        if (isSessionCommand(sql, backslashEscapes)) {
+            handleSessionCommand(sql, backslashEscapes);
+            currentResultSet = new MetabaseResultSet(this,
+                new MetabaseQueryResult(new ArrayList<>(), new ArrayList<>()));
+            updateCount = -1;
+            return currentResultSet;
+        }
         
         try {
             MetabaseQueryResult result = apiClient.executeQuery(sql, databaseName);
@@ -85,6 +95,14 @@ public class MetabaseStatement implements Statement {
     @Override
     public int executeUpdate(String sql) throws SQLException {
         closeCurrentResultSet();
+        boolean backslashEscapes = usesBackslashEscapes();
+        rejectMultipleSessionCommandStatements(sql, backslashEscapes);
+        
+        if (isSessionCommand(sql, backslashEscapes)) {
+            handleSessionCommand(sql, backslashEscapes);
+            updateCount = 0;
+            return 0;
+        }
         
         throw new SQLFeatureNotSupportedException("Metabase is read-only. Updates are not supported.");
     }
@@ -153,11 +171,19 @@ public class MetabaseStatement implements Statement {
     @Override
     public boolean execute(String sql) throws SQLException {        
         closeCurrentResultSet();
+        boolean backslashEscapes = usesBackslashEscapes();
+        rejectMultipleSessionCommandStatements(sql, backslashEscapes);
         
         if (isCustomCommand(sql)) {
             currentResultSet = executeCustomCommand(sql);
             updateCount = -1;
             return true;
+        }
+        
+        if (isSessionCommand(sql, backslashEscapes)) {
+            handleSessionCommand(sql, backslashEscapes);
+            updateCount = 0;
+            return false;
         }
         
         try {
@@ -362,9 +388,14 @@ public class MetabaseStatement implements Statement {
      * @throws SQLException If close operation fails
      */
     protected void closeCurrentResultSet() throws SQLException {
-        if (currentResultSet != null && !currentResultSet.isClosed()) {
-            currentResultSet.close();
-            currentResultSet = null;
+        if (currentResultSet != null) {
+            try {
+                if (!currentResultSet.isClosed()) {
+                    currentResultSet.close();
+                }
+            } finally {
+                currentResultSet = null;
+            }
         }
     }
     
@@ -381,6 +412,389 @@ public class MetabaseStatement implements Statement {
         
         String cleanSql = sql.trim().toLowerCase();
         return cleanSql.startsWith("metabase ");
+    }
+    
+    private static final java.util.regex.Pattern SESSION_COMMAND_PATTERN = java.util.regex.Pattern.compile(
+        "^(set(?!\\s+statement(?:\\s|$))|reset|use|discard)(?:\\s+.*)?$",
+        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+
+    private static final java.util.regex.Pattern SESSION_COMMAND_START_PATTERN = java.util.regex.Pattern.compile(
+        "^(set|reset|use|discard)(?:\\s|;|/\\*|--|$).*",
+        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+    
+    private static final java.util.regex.Pattern SEARCH_PATH_PATTERN = java.util.regex.Pattern.compile(
+        "^set\\s+(?:(?:session|local)\\s+)?(?:search_path\\s*(?:=|\\s+to\\s+)|schema\\s+)(.+?)\\s*;?$",
+        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+
+    private static final java.util.regex.Pattern DOLLAR_QUOTE_DELIMITER_PATTERN = java.util.regex.Pattern.compile(
+        "\\$(?:[A-Za-z_][A-Za-z0-9_]*)?\\$");
+    
+    /**
+     * Strips leading whitespace and SQL comments from a statement.
+     */
+    static String stripLeadingComments(String sql) {
+        if (sql == null) {
+            return "";
+        }
+        int index = 0;
+        while (index < sql.length()) {
+            while (index < sql.length() && Character.isWhitespace(sql.charAt(index))) {
+                index++;
+            }
+            if (sql.startsWith("--", index)) {
+                index += 2;
+                while (index < sql.length() && sql.charAt(index) != '\n' && sql.charAt(index) != '\r') {
+                    index++;
+                }
+            } else if (sql.startsWith("/*", index)) {
+                int depth = 1;
+                index += 2;
+                while (index < sql.length() && depth > 0) {
+                    if (sql.startsWith("/*", index)) {
+                        depth++;
+                        index += 2;
+                    } else if (sql.startsWith("*/", index)) {
+                        depth--;
+                        index += 2;
+                    } else {
+                        index++;
+                    }
+                }
+                if (depth > 0) {
+                    return "";
+                }
+            } else {
+                return sql.substring(index).trim();
+            }
+        }
+        return "";
+    }
+
+    /**
+     * MySQL/MariaDB treat backslash as an escape character inside string literals.
+     */
+    private boolean usesBackslashEscapes() {
+        if (apiClient == null) {
+            return false;
+        }
+        MetabaseDatabase db = apiClient.getDatabaseByName(databaseName);
+        return db != null && db.getEngine() != null
+            && ("mysql".equalsIgnoreCase(db.getEngine()) || "mariadb".equalsIgnoreCase(db.getEngine()));
+    }
+
+    private static boolean isEscapeStringPrefix(String sql, int quoteIndex) {
+        if (quoteIndex < 1) {
+            return false;
+        }
+        char prefix = sql.charAt(quoteIndex - 1);
+        if (prefix != 'E' && prefix != 'e') {
+            return false;
+        }
+        if (quoteIndex < 2) {
+            return true;
+        }
+        char beforePrefix = sql.charAt(quoteIndex - 2);
+        return !(Character.isLetterOrDigit(beforePrefix) || beforePrefix == '_' || beforePrefix == '$');
+    }
+
+    private static String singleStatementWithoutComments(String sql, boolean backslashEscapes) {
+        if (sql == null) {
+            return null;
+        }
+        StringBuilder statement = new StringBuilder();
+        int blockCommentDepth = 0;
+        boolean lineComment = false;
+        boolean statementEnded = false;
+        char quote = 0;
+        boolean quoteBackslashEscapes = false;
+        String dollarQuoteDelimiter = null;
+
+        for (int i = 0; i < sql.length(); i++) {
+            char current = sql.charAt(i);
+            char next = i + 1 < sql.length() ? sql.charAt(i + 1) : 0;
+
+            if (dollarQuoteDelimiter != null) {
+                if (sql.startsWith(dollarQuoteDelimiter, i)) {
+                    statement.append(dollarQuoteDelimiter);
+                    i += dollarQuoteDelimiter.length() - 1;
+                    dollarQuoteDelimiter = null;
+                } else {
+                    statement.append(current);
+                }
+                continue;
+            }
+            if (lineComment) {
+                if (current == '\n' || current == '\r') {
+                    lineComment = false;
+                    statement.append(' ');
+                }
+                continue;
+            }
+            if (blockCommentDepth > 0) {
+                if (current == '/' && next == '*') {
+                    blockCommentDepth++;
+                    i++;
+                } else if (current == '*' && next == '/') {
+                    blockCommentDepth--;
+                    i++;
+                    if (blockCommentDepth == 0) {
+                        statement.append(' ');
+                    }
+                }
+                continue;
+            }
+            if (quote != 0) {
+                statement.append(current);
+                if (quoteBackslashEscapes && current == '\\' && next != 0) {
+                    statement.append(next);
+                    i++;
+                } else if (current == quote) {
+                    if (next == quote) {
+                        statement.append(next);
+                        i++;
+                    } else {
+                        quote = 0;
+                    }
+                }
+                continue;
+            }
+            if (current == '-' && next == '-') {
+                lineComment = true;
+                i++;
+            } else if (current == '/' && next == '*') {
+                blockCommentDepth = 1;
+                i++;
+            } else if (current == '$' && (dollarQuoteDelimiter = dollarQuoteDelimiterAt(sql, i)) != null) {
+                statement.append(dollarQuoteDelimiter);
+                i += dollarQuoteDelimiter.length() - 1;
+            } else if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+                quoteBackslashEscapes = current != '`'
+                    && (backslashEscapes || (current == '\'' && isEscapeStringPrefix(sql, i)));
+                statement.append(current);
+            } else if (current == '[') {
+                quote = ']';
+                quoteBackslashEscapes = false;
+                statement.append(current);
+            } else if (current == ';') {
+                statementEnded = true;
+            } else if (statementEnded && !Character.isWhitespace(current)) {
+                return null;
+            } else if (!statementEnded) {
+                statement.append(current);
+            }
+        }
+        if (quote != 0 || dollarQuoteDelimiter != null || blockCommentDepth != 0 || statement.toString().trim().isEmpty()) {
+            return null;
+        }
+        return statement.toString().trim();
+    }
+
+    private static String dollarQuoteDelimiterAt(String sql, int index) {
+        java.util.regex.Matcher matcher = DOLLAR_QUOTE_DELIMITER_PATTERN.matcher(sql);
+        matcher.region(index, sql.length());
+        return matcher.lookingAt() ? matcher.group() : null;
+    }
+    
+    /**
+     * Checks if SQL is a session-level statement (SET, RESET, USE, DISCARD).
+     * Metabase only runs queries that return a result set and uses pooled
+     * connections, so session state cannot be applied remotely. Clients such as
+     * IntelliJ/DataGrip issue these statements (e.g. {@code set search_path = "x"})
+     * when a schema is selected in the console, so they are handled locally.
+     * MariaDB SET STATEMENT wraps a query and must be executed remotely instead.
+     */
+    static boolean isSessionCommand(String sql) {
+        return isSessionCommand(sql, false);
+    }
+
+    static boolean isSessionCommand(String sql, boolean backslashEscapes) {
+        if (sql == null) {
+            return false;
+        }
+        String statement = singleStatementWithoutComments(sql, backslashEscapes);
+        return statement != null && SESSION_COMMAND_PATTERN.matcher(statement).matches();
+    }
+
+    private static void rejectMultipleSessionCommandStatements(String sql, boolean backslashEscapes)
+            throws SQLException {
+        if (SESSION_COMMAND_START_PATTERN.matcher(stripLeadingComments(sql)).matches()
+                && singleStatementWithoutComments(sql, backslashEscapes) == null) {
+            throw new SQLException("Multiple SQL statements are not supported.");
+        }
+    }
+    
+    /**
+     * Extracts the first schema from a {@code SET search_path} / {@code SET SCHEMA} statement.
+     *
+     * @return schema name, or null if the statement does not set a schema
+     */
+    static String extractSchemaFromSessionCommand(String sql) {
+        return extractSchemaFromSessionCommand(sql, false);
+    }
+
+    static String extractSchemaFromSessionCommand(String sql, boolean backslashEscapes) {
+        if (sql == null) {
+            return null;
+        }
+        String statement = singleStatementWithoutComments(sql, backslashEscapes);
+        if (statement == null) {
+            return null;
+        }
+        java.util.regex.Matcher m = SEARCH_PATH_PATTERN.matcher(statement);
+        if (!m.matches()) {
+            return null;
+        }
+        String values = m.group(1).trim();
+        String first;
+        String dollarQuoteDelimiter = dollarQuoteDelimiterAt(values, 0);
+        if (dollarQuoteDelimiter != null) {
+            int closingDelimiter = values.indexOf(dollarQuoteDelimiter, dollarQuoteDelimiter.length());
+            if (closingDelimiter < 0) {
+                return null;
+            }
+            int remainder = closingDelimiter + dollarQuoteDelimiter.length();
+            while (remainder < values.length() && Character.isWhitespace(values.charAt(remainder))) {
+                remainder++;
+            }
+            if (remainder < values.length() && values.charAt(remainder) != ',') {
+                return null;
+            }
+            first = values.substring(dollarQuoteDelimiter.length(), closingDelimiter);
+        } else if (!values.isEmpty() && (values.charAt(0) == '"' || values.charAt(0) == '\''
+                || (values.length() > 1 && (values.charAt(0) == 'E' || values.charAt(0) == 'e')
+                    && values.charAt(1) == '\''))) {
+            boolean escapeString = values.charAt(0) == 'E' || values.charAt(0) == 'e';
+            int quoteIndex = escapeString ? 1 : 0;
+            char quote = values.charAt(quoteIndex);
+            boolean quoteBackslashEscapes = escapeString || backslashEscapes;
+            StringBuilder decoded = new StringBuilder();
+            int i = quoteIndex + 1;
+            boolean closed = false;
+            while (i < values.length()) {
+                char current = values.charAt(i);
+                if (quoteBackslashEscapes && current == '\\' && i + 1 < values.length()) {
+                    i = decodeBackslashEscape(values, i + 1, escapeString, decoded);
+                } else if (current == quote) {
+                    if (i + 1 < values.length() && values.charAt(i + 1) == quote) {
+                        decoded.append(quote);
+                        i += 2;
+                    } else {
+                        i++;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    decoded.append(current);
+                    i++;
+                }
+            }
+            while (i < values.length() && Character.isWhitespace(values.charAt(i))) {
+                i++;
+            }
+            if (!closed || (i < values.length() && values.charAt(i) != ',')) {
+                return null;
+            }
+            first = decoded.toString();
+        } else {
+            int comma = values.indexOf(',');
+            int whitespace = -1;
+            for (int i = 0; i < values.length(); i++) {
+                if (Character.isWhitespace(values.charAt(i))) {
+                    whitespace = i;
+                    break;
+                }
+            }
+            int end = comma < 0 ? values.length() : comma;
+            if (whitespace >= 0 && whitespace < end) {
+                end = whitespace;
+            }
+            first = values.substring(0, end).trim();
+        }
+        if (first.isEmpty() || first.equalsIgnoreCase("default")) {
+            return null;
+        }
+        return first;
+    }
+    
+    /**
+     * Decodes the escape sequence following a backslash at {@code index} and appends it to {@code decoded},
+     * using PostgreSQL E-string rules or MySQL/MariaDB rules.
+     *
+     * @return index of the first character after the escape sequence
+     */
+    private static int decodeBackslashEscape(String value, int index, boolean postgresEscapes, StringBuilder decoded) {
+        char escaped = value.charAt(index);
+        switch (escaped) {
+            case 'b':
+                decoded.append('\b');
+                return index + 1;
+            case 'n':
+                decoded.append('\n');
+                return index + 1;
+            case 'r':
+                decoded.append('\r');
+                return index + 1;
+            case 't':
+                decoded.append('\t');
+                return index + 1;
+            default:
+                break;
+        }
+        if (postgresEscapes) {
+            if (escaped == 'f') {
+                decoded.append('\f');
+                return index + 1;
+            }
+            if (escaped >= '0' && escaped <= '7') {
+                int end = index;
+                while (end < value.length() && end < index + 3 && value.charAt(end) >= '0' && value.charAt(end) <= '7') {
+                    end++;
+                }
+                decoded.append((char) (Integer.parseInt(value.substring(index, end), 8) & 0xFF));
+                return end;
+            }
+            int hexDigits = escaped == 'x' ? 2 : escaped == 'u' ? 4 : escaped == 'U' ? 8 : 0;
+            if (hexDigits > 0) {
+                int start = index + 1;
+                int end = start;
+                while (end < value.length() && end < start + hexDigits
+                        && Character.digit(value.charAt(end), 16) >= 0) {
+                    end++;
+                }
+                if ((escaped == 'x' && end > start) || end == start + hexDigits) {
+                    long codePoint = Long.parseLong(value.substring(start, end), 16);
+                    if (codePoint <= Character.MAX_CODE_POINT) {
+                        decoded.appendCodePoint((int) codePoint);
+                        return end;
+                    }
+                }
+            }
+        } else {
+            switch (escaped) {
+                case '0':
+                    decoded.append('\0');
+                    return index + 1;
+                case 'Z':
+                    decoded.append((char) 0x1A);
+                    return index + 1;
+                case '%':
+                case '_':
+                    decoded.append('\\').append(escaped);
+                    return index + 1;
+                default:
+                    break;
+            }
+        }
+        decoded.append(escaped);
+        return index + 1;
+    }
+
+    private void handleSessionCommand(String sql, boolean backslashEscapes) throws SQLException {
+        String schema = extractSchemaFromSessionCommand(sql, backslashEscapes);
+        if (schema != null) {
+            connection.setSchema(schema);
+        }
     }
     
     /**
