@@ -661,14 +661,21 @@ public class MetabaseStatement implements Statement {
                 return null;
             }
             first = values.substring(dollarQuoteDelimiter.length(), closingDelimiter);
-        } else if (!values.isEmpty() && (values.charAt(0) == '"' || values.charAt(0) == '\'')) {
-            char quote = values.charAt(0);
+        } else if (!values.isEmpty() && (values.charAt(0) == '"' || values.charAt(0) == '\''
+                || (values.length() > 1 && (values.charAt(0) == 'E' || values.charAt(0) == 'e')
+                    && values.charAt(1) == '\''))) {
+            boolean escapeString = values.charAt(0) == 'E' || values.charAt(0) == 'e';
+            int quoteIndex = escapeString ? 1 : 0;
+            char quote = values.charAt(quoteIndex);
+            boolean quoteBackslashEscapes = escapeString || backslashEscapes;
             StringBuilder decoded = new StringBuilder();
-            int i = 1;
+            int i = quoteIndex + 1;
             boolean closed = false;
             while (i < values.length()) {
                 char current = values.charAt(i);
-                if (current == quote) {
+                if (quoteBackslashEscapes && current == '\\' && i + 1 < values.length()) {
+                    i = decodeBackslashEscape(values, i + 1, escapeString, decoded);
+                } else if (current == quote) {
                     if (i + 1 < values.length() && values.charAt(i + 1) == quote) {
                         decoded.append(quote);
                         i += 2;
@@ -710,6 +717,79 @@ public class MetabaseStatement implements Statement {
         return first;
     }
     
+    /**
+     * Decodes the escape sequence following a backslash at {@code index} and appends it to {@code decoded},
+     * using PostgreSQL E-string rules or MySQL/MariaDB rules.
+     *
+     * @return index of the first character after the escape sequence
+     */
+    private static int decodeBackslashEscape(String value, int index, boolean postgresEscapes, StringBuilder decoded) {
+        char escaped = value.charAt(index);
+        switch (escaped) {
+            case 'b':
+                decoded.append('\b');
+                return index + 1;
+            case 'n':
+                decoded.append('\n');
+                return index + 1;
+            case 'r':
+                decoded.append('\r');
+                return index + 1;
+            case 't':
+                decoded.append('\t');
+                return index + 1;
+            default:
+                break;
+        }
+        if (postgresEscapes) {
+            if (escaped == 'f') {
+                decoded.append('\f');
+                return index + 1;
+            }
+            if (escaped >= '0' && escaped <= '7') {
+                int end = index;
+                while (end < value.length() && end < index + 3 && value.charAt(end) >= '0' && value.charAt(end) <= '7') {
+                    end++;
+                }
+                decoded.append((char) (Integer.parseInt(value.substring(index, end), 8) & 0xFF));
+                return end;
+            }
+            int hexDigits = escaped == 'x' ? 2 : escaped == 'u' ? 4 : escaped == 'U' ? 8 : 0;
+            if (hexDigits > 0) {
+                int start = index + 1;
+                int end = start;
+                while (end < value.length() && end < start + hexDigits
+                        && Character.digit(value.charAt(end), 16) >= 0) {
+                    end++;
+                }
+                if ((escaped == 'x' && end > start) || end == start + hexDigits) {
+                    long codePoint = Long.parseLong(value.substring(start, end), 16);
+                    if (codePoint <= Character.MAX_CODE_POINT) {
+                        decoded.appendCodePoint((int) codePoint);
+                        return end;
+                    }
+                }
+            }
+        } else {
+            switch (escaped) {
+                case '0':
+                    decoded.append('\0');
+                    return index + 1;
+                case 'Z':
+                    decoded.append((char) 0x1A);
+                    return index + 1;
+                case '%':
+                case '_':
+                    decoded.append('\\').append(escaped);
+                    return index + 1;
+                default:
+                    break;
+            }
+        }
+        decoded.append(escaped);
+        return index + 1;
+    }
+
     private void handleSessionCommand(String sql, boolean backslashEscapes) throws SQLException {
         String schema = extractSchemaFromSessionCommand(sql, backslashEscapes);
         if (schema != null) {

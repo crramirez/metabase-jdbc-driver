@@ -113,6 +113,12 @@ class MetabaseStatementSessionCommandTest {
             "SET search_path = $$public$$"));
         assertEquals("sales,west", MetabaseStatement.extractSchemaFromSessionCommand(
             "SET search_path = $schema$sales,west$schema$, public"));
+        assertEquals("public", MetabaseStatement.extractSchemaFromSessionCommand("SET SCHEMA E'public'"));
+        assertEquals("can't", MetabaseStatement.extractSchemaFromSessionCommand(
+            "SET search_path = E'can\\'t', public"));
+        assertEquals("a\tbA", MetabaseStatement.extractSchemaFromSessionCommand(
+            "SET search_path = e'a\\tb\\x41'"));
+        assertEquals("can't", MetabaseStatement.extractSchemaFromSessionCommand("SET SCHEMA 'can\\'t'", true));
         assertNull(MetabaseStatement.extractSchemaFromSessionCommand("set search_path to default"));
         assertNull(MetabaseStatement.extractSchemaFromSessionCommand("set timezone = 'UTC'"));
         assertNull(MetabaseStatement.extractSchemaFromSessionCommand("SET search_path TO public; SELECT 1"));
