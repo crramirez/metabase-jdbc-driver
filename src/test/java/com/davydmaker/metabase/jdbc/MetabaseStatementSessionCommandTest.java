@@ -1,9 +1,12 @@
 package com.davydmaker.metabase.jdbc;
 
 import com.davydmaker.metabase.api.MetabaseApiClient;
+import com.davydmaker.metabase.api.MetabaseQueryResult;
 import org.junit.jupiter.api.Test;
 
 import java.sql.ResultSet;
+import java.sql.SQLFeatureNotSupportedException;
+import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -23,13 +26,45 @@ class MetabaseStatementSessionCommandTest {
         assertTrue(MetabaseStatement.isSessionCommand("SET search_path = \"a;b\""));
         assertTrue(MetabaseStatement.isSessionCommand("SET application_name = $$a;b$$"));
         assertTrue(MetabaseStatement.isSessionCommand("SET application_name = $tag$a;b$tag$"));
+        assertTrue(MetabaseStatement.isSessionCommand("SET statement_timeout = 1000"));
 
         assertFalse(MetabaseStatement.isSessionCommand("select * from settings"));
+        assertFalse(MetabaseStatement.isSessionCommand("SET STATEMENT max_statement_time=1 FOR SELECT 1"));
+        assertFalse(MetabaseStatement.isSessionCommand(
+            "-- query\nset /* option */ statement /* limit */ max_statement_time=1 FOR SELECT 1;"));
         assertFalse(MetabaseStatement.isSessionCommand("settings"));
         assertFalse(MetabaseStatement.isSessionCommand("user_store"));
         assertFalse(MetabaseStatement.isSessionCommand("SET search_path TO public; SELECT 1"));
         assertFalse(MetabaseStatement.isSessionCommand("SET search_path TO 'public\\'; SELECT ''"));
         assertFalse(MetabaseStatement.isSessionCommand(null));
+    }
+
+    @Test
+    void forwardsSetStatementQueriesToMetabase() throws Exception {
+        String[] queries = {
+            "SET STATEMENT max_statement_time=1 FOR SELECT 1",
+            "-- query\nsEt /* option */ StAtEmEnT /* limit */ max_statement_time=1 FOR SELECT 1;"
+        };
+        for (String sql : queries) {
+            MetabaseApiClient apiClient = mock(MetabaseApiClient.class);
+            MetabaseConnection connection = mock(MetabaseConnection.class);
+            MetabaseStatement stmt = new MetabaseStatement(connection, apiClient, "db");
+            when(apiClient.executeQuery(sql, "db")).thenAnswer(invocation -> new MetabaseQueryResult(
+                Collections.emptyList(), Collections.singletonList(Collections.singletonList(1))));
+
+            assertTrue(stmt.execute(sql));
+            assertEquals(-1, stmt.getUpdateCount());
+            assertTrue(stmt.getResultSet().next());
+            try (ResultSet rs = stmt.executeQuery(sql)) {
+                assertTrue(rs.next());
+                assertEquals(-1, stmt.getUpdateCount());
+            }
+            assertThrows(SQLFeatureNotSupportedException.class, () -> stmt.executeUpdate(sql));
+
+            verify(apiClient, times(2)).executeQuery(sql, "db");
+            verify(connection, never()).setSchema(anyString());
+            stmt.close();
+        }
     }
 
     @Test

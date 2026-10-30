@@ -412,7 +412,7 @@ public class MetabaseStatement implements Statement {
     }
     
     private static final java.util.regex.Pattern SESSION_COMMAND_PATTERN = java.util.regex.Pattern.compile(
-        "^(set|reset|use|discard)(?:\\s+.*)?$",
+        "^(set(?!\\s+statement(?:\\s|$))|reset|use|discard)(?:\\s+.*)?$",
         java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
 
     private static final java.util.regex.Pattern SESSION_COMMAND_START_PATTERN = java.util.regex.Pattern.compile(
@@ -565,6 +565,7 @@ public class MetabaseStatement implements Statement {
      * connections, so session state cannot be applied remotely. Clients such as
      * IntelliJ/DataGrip issue these statements (e.g. {@code set search_path = "x"})
      * when a schema is selected in the console, so they are handled locally.
+     * MariaDB SET STATEMENT wraps a query and must be executed remotely instead.
      */
     static boolean isSessionCommand(String sql) {
         if (sql == null) {
